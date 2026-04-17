@@ -86,6 +86,35 @@ def _table(headers, rows, row_styles=None, row_attrs=None):
     return out
 
 
+_DATE_SUFFIXES_VIZ = {
+    "_year_start", "_year_end", "_month_start", "_month_end",
+    "_day_start", "_day_end", "_hour_start", "_hour_end",
+    "_minute_start", "_minute_end", "_second_start", "_second_end",
+    "_timezone",
+}
+
+
+def _collapse_field_names(names):
+    """Collapse date component field names into their prefix.
+    e.g. ['effective_date_year_start', 'effective_date_year_end', ...] -> 'effective_date'
+    """
+    collapsed = []
+    seen_prefixes = set()
+    for name in names:
+        prefix = None
+        for suffix in _DATE_SUFFIXES_VIZ:
+            if name.endswith(suffix):
+                prefix = name[: -len(suffix)]
+                break
+        if prefix:
+            if prefix not in seen_prefixes:
+                seen_prefixes.add(prefix)
+                collapsed.append(prefix)
+        else:
+            collapsed.append(name)
+    return ", ".join(collapsed)
+
+
 def _item_verdict_counts(item):
     counts = Counter()
     for f in item.get("fields") or []:
@@ -110,10 +139,11 @@ def _discover_verdicts(items):
 
 
 def _sort_key(item):
-    if _item_is_fully_correct(item):
-        return 2
     counts = _item_verdict_counts(item)
-    return 0 if any(v != "correct" for v in counts) else 1
+    n_fabricated = counts.get("fabricated", 0)
+    n_debatable = counts.get("debatable", 0)
+    bin_key = 0 if n_fabricated else (1 if n_debatable else 2)
+    return (bin_key, -n_fabricated, -n_debatable)
 
 
 def _verdict_badge(counts, verdicts, colors):
@@ -207,23 +237,66 @@ def _render_detail(items, index, verdicts, version):
     counts = _item_verdict_counts(item)
     badge = _verdict_badge(counts, verdicts, colors)
 
-    # Verdict table rows
+    # Verdict table — group by row, deduplicate identical issues, collapse date components
     fields = item.get("fields") or []
-    verdict_rows = ""
-    for f in fields:
-        v = f.get("verdict", "")
-        bg = colors.get(v, "")
-        style = f' style="background:{bg};"' if bg else ""
-        verdict_rows += (
-            f'<tr data-verdict="{html.escape(v)}"{style}>'
-            f'<td><b>{html.escape(f.get("name", ""))}</b></td>'
-            f'<td>{html.escape(v)}</td>'
-            f'<td>{html.escape(f.get("desc", "") or "—")}</td></tr>'
-        )
-    verdict_html = (
-        f'<h3>Spot Check</h3><table><tr><th>Field</th><th>Verdict</th><th>Description</th></tr>{verdict_rows}</table>'
-        if fields else '<h3>Spot Check</h3><p>No field verdicts.</p>'
-    )
+    if not fields:
+        verdict_html = '<h3>Spot Check</h3><p>No field verdicts.</p>'
+    else:
+        # Group fields by row_index
+        from collections import OrderedDict
+        rows_grouped = OrderedDict()
+        for f in fields:
+            ri = f.get("row_index", 0)
+            rows_grouped.setdefault(ri, []).append(f)
+
+        n_correct = sum(1 for f in fields if f.get("verdict") == "correct")
+        n_issues = len(fields) - n_correct
+        multi_row = len(rows_grouped) > 1
+
+        if n_issues == 0:
+            verdict_html = f'<h3>Spot Check</h3><p>All {len(fields)} fields correct.</p>'
+        else:
+            # Deduplicate: group issues by (verdict, desc) across all rows,
+            # collect field names and row indices
+            deduped = OrderedDict()  # (verdict, desc) -> {names: set, rows: set}
+            per_row_correct = Counter()
+            per_row_total = Counter()
+            for f in fields:
+                ri = f.get("row_index", 0)
+                per_row_total[ri] += 1
+                if f.get("verdict") == "correct":
+                    per_row_correct[ri] += 1
+                    continue
+                # Rename "id" field to "row" — the LLM uses it to flag entire-row issues
+                if f.get("name") == "id":
+                    f = {**f, "name": "(whole row)"}
+                key = (f.get("verdict", ""), f.get("desc", ""))
+                if key not in deduped:
+                    deduped[key] = {"names": [], "rows": set()}
+                deduped[key]["names"].append(f.get("name", ""))
+                deduped[key]["rows"].add(ri)
+
+            verdict_rows = ""
+            for (v, desc), info in deduped.items():
+                bg = colors.get(v, "")
+                style = f' style="background:{bg};"' if bg else ""
+                # Collapse field names that share a date prefix
+                names = _collapse_field_names(info["names"])
+                row_label = ""
+                if multi_row:
+                    sorted_rows = sorted(info["rows"])
+                    row_label = f' <span style="color:#999;font-size:11px;">[row{"s" if len(sorted_rows) > 1 else ""} {", ".join(str(r) for r in sorted_rows)}]</span>'
+                verdict_rows += (
+                    f'<tr data-verdict="{html.escape(v)}"{style}>'
+                    f'<td><b>{html.escape(names)}</b>{row_label}</td>'
+                    f'<td>{html.escape(v)}</td>'
+                    f'<td>{html.escape(desc or "—")}</td></tr>'
+                )
+            verdict_html = (
+                f'<h3>Spot Check ({n_issues} issue{"s" if n_issues != 1 else ""}, '
+                f'{n_correct} correct)</h3>'
+                f'<table><tr><th>Field</th><th>Verdict</th><th>Description</th></tr>{verdict_rows}</table>'
+            )
 
     # Extracted rows
     extracted = item.get("extracted_rows", [])

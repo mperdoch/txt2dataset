@@ -192,7 +192,10 @@ class OpenRouterAPIBuilder:
 
                 all_fields = []
                 for c in check:
-                    all_fields.extend(c.get("fields", []))
+                    row_idx = c.get("id")
+                    for f in c.get("fields", []):
+                        f["row_index"] = row_idx
+                        all_fields.append(f)
 
                 item = {
                     "id": row_id,
